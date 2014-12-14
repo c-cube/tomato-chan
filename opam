@@ -1,0 +1,29 @@
+opam-version: "1.2"
+author: "Simon Cruanes"
+maintainer: "simon.cruanes.2007@m4x.org"
+build: [
+    ["./configure" "--prefix" prefix]
+    [make "build"]
+]
+install: [
+    [make "install"]
+]
+build-doc: [ make "doc" ]
+build-test: [ make "test" ]
+remove: [
+    ["ocamlfind" "remove" "tomato-chan"]
+]
+depends: [
+    "ocamlfind" {build}
+    "lwt"
+    "unix"
+    "containers"
+    "irc-client"
+    "re"
+]
+tags: [ "irc" ]
+homepage: "https://github.com/c-cube/tomato-chan/"
+doc: "none"
+available: [ocaml-version >= "4.00.0"]
+dev-repo: "https://github.com/c-cube/tomato-chan.git"
+bug-reports: "https://github.com/c-cube/tomato-chan/issues/"
