@@ -49,6 +49,7 @@ let section = Lwt_log.Section.make "tomato_chan"
 let () =
   Lwt.async_exception_hook := (fun e ->
     print_endline ("async error: "^ Printexc.to_string e);
+    flush stdout
   )
 
 (** {2 Core code} *)
@@ -75,8 +76,9 @@ let connect params =
 module PluginManager = struct
   type plugin = {
     pid : int; (* shortcut *)
-    proc : Lwt_process.process_full;
-    mutable thread : unit Lwt.t;  (* reading/answering thread *)
+    name : string;  (* plugin named by its file path *)
+    proc : Lwt_process.process;
+    mutable threads : unit Lwt.t list;  (* reading/answering thread+termination thread *)
     mutable registered_all : bool;
     mutable registered : string list; (* set of registered chans *)
   }
@@ -87,61 +89,95 @@ module PluginManager = struct
     chans : (string, unit) Hashtbl.t; (* chan *)
     mutable state : [`Init | `Stop | `Loop];
     mutable dirs : ([`Prefix of string | `All] * string) list;
-    mutable plugins : (string,plugin) Hashtbl.t;
+    mutable plugins : plugin list;
   }
 
   let make conn dirs =
     Lwt_inotify.create () >>= fun inotify ->
     Lwt.return {
       conn; inotify; state=`Init; dirs;
-      chans=Hashtbl.create 16; plugins = Hashtbl.create 16;
+      chans=Hashtbl.create 16; plugins = [];
     }
 
-  let join m chan =
-    if not (Hashtbl.mem m.chans chan)
-    then Irc.send_join ~connection:m.conn ~channel:chan
-    else Lwt.return_unit
+  let kill_plugin plugin =
+    Lwt_log.ign_debug_f "kill plugin %s (pid %d)" plugin.name plugin.proc#pid;
+    List.iter Lwt.cancel plugin.threads;
+    plugin.proc#terminate;
+    ()
+
+  let remove_plugin m name =
+    m.plugins <- List.filter
+      (fun p ->
+        let keep = p.name <> name in
+        if not keep then kill_plugin p;
+        keep
+      ) m.plugins
 
   (* watch the given process and communicate with it *)
-  let watch_plugin m plugin =
-    let lines = Lwt_io.read_lines plugin.proc#stdout in
-    Lwt_stream.iter_s
-      (fun line ->
+  let rec handle_plugin m plugin =
+    Lwt_io.read_line_opt plugin.proc#stdout >>=
+    function
+    | None ->
+        Lwt_log.ign_debug_f "could not read from plugin %s (pid %d)"
+          plugin.name plugin.proc#pid;
+        remove_plugin m plugin.name;
+        Lwt.return_unit
+    | Some line ->
         let json = Yojson.Safe.from_string line in
         match Msg.plugin_to_core_of_yojson json with
         | `Ok (Msg.Register chan) -> assert false (* TODO *)
         | `Ok (Msg.Unregister chan) ->  assert false (* TODO *)
         | `Ok Msg.RegisterAll ->
             plugin.registered_all <- true;
-            Lwt.return_unit
-        | `Ok (Msg.Join chan) -> join m chan
+            handle_plugin m plugin
+        | `Ok (Msg.Join chan) ->
+            if not (Hashtbl.mem m.chans chan)
+            then (
+              Lwt_log.ign_info_f ~section "join chan %s" chan;
+              Irc.send_join ~connection:m.conn ~channel:chan >>= fun () ->
+              handle_plugin m plugin
+            ) else handle_plugin m plugin
         | `Ok (Msg.SendMessage msg) ->
             Lwt_log.ign_debug_f ~section "send message %s" (Msg.show_irc_message msg);
             Irc.send_privmsg ~connection:m.conn
-              ~target:msg.Msg.dest ~message:msg.Msg.content
-        | `Error msg -> Lwt.fail (Failure msg)
-      ) lines
+              ~target:msg.Msg.dest ~message:msg.Msg.content >>= fun () ->
+            handle_plugin m plugin
+        | `Error msg ->
+            Lwt_log.ign_error_f "plugin error: %s" msg;
+            remove_plugin m plugin.name;
+            Lwt.return_unit
 
   (* send [msg] to the given plugin *)
   let send_plugin p msg =
     let json = Yojson.Safe.to_string (Msg.core_to_plugin_to_yojson msg) in
+    Lwt_log.ign_debug_f "json for plugin: %s" json;
     Lwt_io.write_line p.proc#stdin json >>= fun () ->
     Lwt_io.flush p.proc#stdin
 
-  (* start given file, assuming it's a plugin and it's not started already *)
+  (* wait for the process to terminate, and then remove the plugin *)
+  let watch_plugin_process m plugin =
+    plugin.proc#status >>= fun _ ->
+    Lwt_log.ign_debug_f "remove terminated plugin %s" plugin.name;
+    remove_plugin m plugin.name;
+    Lwt.return_unit
+
+  (* start given file, assuming it's a plugin. If it's started, remove
+      it and restart it *)
   let start_plugin m file =
     Lwt_log.ign_info_f ~section "try to start %s as a plugin" file;
-    if Hashtbl.mem m.plugins file
-    then ()
-    else try
-      let cmd = (file, [| |]) in
-      let proc = Lwt_process.open_process_full cmd in
+    (* first remove the plugin, if present *)
+    remove_plugin m file;
+    try
+      let cmd = (file, [| file |]) in
+      (* open process, redirecting stdin/stdout *)
+      let proc = Lwt_process.open_process cmd in
       let plugin = {
-        pid=proc#pid; proc; thread=Lwt.return_unit;
+        pid=proc#pid; proc; threads=[]; name=file;
         registered=[]; registered_all=false;
       } in
-      plugin.thread <- watch_plugin m plugin;
-      Hashtbl.add m.plugins file plugin;
+      plugin.threads <- [handle_plugin m plugin; watch_plugin_process m plugin];
+      m.plugins <- plugin :: m.plugins;
+      Lwt_log.ign_info_f ~section "started plugin %s (pid %d)" file proc#pid
     with e ->
       Lwt_log.ign_error_f ~section "error trying to start plugin %s: %s"
         file (Printexc.to_string e);
@@ -161,6 +197,17 @@ module PluginManager = struct
       | `Prefix p -> str_is_prefix filename p 0
     )
 
+  (* transform "foo!bar" into "foo" *)
+  let left_of_bang s =
+    try
+      let i = String.index s '!' in
+      String.sub s 0 i
+    with Not_found -> s
+
+  let opt_map f = function
+    | None -> None
+    | Some x -> Some (f x)
+
   (* main thread for incoming IRC events *)
   let listen_irc m =
     Irc.listen ~connection:m.conn
@@ -172,27 +219,31 @@ module PluginManager = struct
           {Irc_message.command="PRIVMSG"; prefix=from;
           params=dest::_; trail=Some content} ->
             (* a privmsg *)
+            let from = opt_map left_of_bang from in
             let msg = {Msg.from; dest; content} in
             Lwt_log.ign_debug_f ~section "received message %s" (Msg.show_irc_message msg);
-            Hashtbl.iter
-              (fun _ p ->
+            Lwt_list.iter_p
+              (fun p ->
                 if p.registered_all || List.mem dest p.registered
-                  then Lwt.async (fun () -> send_plugin p (Msg.MessageReceived msg))
-              ) m.plugins;
-            Lwt.return_unit
+                  then send_plugin p (Msg.MessageReceived msg)
+                  else Lwt.return_unit
+              ) m.plugins
         | Irc_message.Message
           {Irc_message.command="JOIN"; prefix=Some joined_who;
             params=joined_chan::_ ; _ } ->
             (* join event *)
+            let joined_who = left_of_bang joined_who in
             let msg = {Msg.joined_who; joined_chan} in
             Lwt_log.ign_debug_f ~section "received %s" (Msg.show_joined_msg msg);
-            Hashtbl.iter
-              (fun _ p ->
-                Lwt.async (fun () -> send_plugin p Msg.(Joined msg))
-              ) m.plugins;
-            Lwt.return_unit
-        | Irc_message.Message _ ->
-            Lwt.return_unit
+            Lwt_list.iter_p
+              (fun p ->
+                send_plugin p Msg.(Joined msg)
+              ) m.plugins
+        | Irc_message.Message {Irc_message.prefix;command;params;trail} ->
+            Lwt_log.debug_f ~section
+              "received: {prefix=%s; command=%s;params=%s;trail=%s}"
+              ([%show: string option] prefix) command
+              ([%show: string list] params) ([%show: string option] trail)
       )
 
   (* start plugins, in the initial state, and also setup watches and
@@ -202,16 +253,17 @@ module PluginManager = struct
     m.state <- `Loop;
     Lwt_list.iter_p
       (fun (prefix, dir) ->
+        Lwt_log.ign_debug_f ~section "start plugins in dir %s" dir;
         (* setup watch *)
         Lwt_inotify.add_watch m.inotify dir
-          [Inotify.S_Create; Inotify.S_Delete_self; Inotify.S_Close_write]
+          [Inotify.S_Create; Inotify.S_Modify; Inotify.S_Delete_self; Inotify.S_Close_write]
         >>= fun _watch ->
         (* start plugins in this dir *)
         let files = Sys.readdir dir in
         Array.iter
           (fun f ->
             if is_potentially_plugin prefix f
-              then start_plugin m f
+              then start_plugin m (Filename.concat dir f)
           ) files;
         Lwt.return_unit
       ) m.dirs
@@ -239,6 +291,7 @@ module PluginManager = struct
     | (_,_,_, None) ->
         watch_inotify m
     | (_,_,_, Some file) ->
+        Lwt_log.ign_debug_f ~section "FS event: file %s" file;
         if is_potentially_plugin_from_dir m file
           then start_plugin m file;
         watch_inotify m
@@ -250,11 +303,7 @@ module PluginManager = struct
 
   let close m =
     Lwt_inotify.close m.inotify >>= fun () ->
-    Hashtbl.iter
-      (fun _ plugin ->
-        Lwt.cancel plugin.thread;
-        plugin.proc#terminate;
-      ) m.plugins;
+    List.iter kill_plugin m.plugins;
     Lwt.return_unit
 end
 
@@ -267,6 +316,7 @@ let main params =
     (fun () ->
       connect params >>= fun conn ->
       Lwt_log.ign_info ~section "connected.";
+      Lwt_unix.sleep 3. >>= fun () ->
       Lwt_list.iter_p
         (fun channel ->
           Lwt_log.ign_info_f ~section "join chan %s" channel;
@@ -285,13 +335,19 @@ let main params =
 
 (** {2 Main} *)
 
-let params = ref {
-  port = 6667;
-  host = "irc.freenode.net";
-  nick = "TomatoChan";
-  chans = [];
-  plugin_dirs = [ `Prefix "tomato_", Filename.dirname Sys.argv.(0) ]
-}
+let params =
+  let progdir = Filename.dirname Sys.argv.(0) in
+  let absdir = if Filename.is_relative progdir
+    then Filename.concat (Sys.getcwd ()) progdir
+    else progdir
+  in
+  ref {
+    port = 6667;
+    host = "irc.freenode.net";
+    nick = "TomatoChan";
+    chans = [];
+    plugin_dirs = [ `Prefix "tomato_plugin_", absdir ]
+  }
 
 let usage = "tomato_chan [options]"
 let do_nothing _ = ()

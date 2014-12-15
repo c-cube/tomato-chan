@@ -35,11 +35,15 @@ let main () =
     (fun json ->
       match TomatoMessage.core_to_plugin_of_yojson json with
       | `Ok (TomatoMessage.MessageReceived {TomatoMessage.from; dest; content}) ->
-          Printf.printf "message from %s to %s: %s\n"
-            ([%show:string option] from) dest content
+          Printf.eprintf "message from %s to %s: %s\n"
+            ([%show:string option] from) dest content;
+          flush stderr
       | `Ok (TomatoMessage.Joined {TomatoMessage.joined_chan; joined_who}) ->
-          Printf.printf "%s joined chan %s\n" joined_who joined_chan
+          Printf.eprintf "%s joined chan %s\n" joined_who joined_chan;
+          flush stderr;
       | `Error msg ->
+          Printf.eprintf "error in tomato_plugin_echo: %s" msg;
+          flush stderr;
           failwith msg
     ) stream
 
