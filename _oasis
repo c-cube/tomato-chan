@@ -12,14 +12,22 @@ AlphaFeatures: compiled_setup_ml
 
 Synopsis:    A modular IRC bot
 
-Library "tomato-chan"
+Library "tomato_chan_msg"
   Path:             src
   Modules:          TomatoMessage
+  BuildDepends:     ppx_deriving_yojson, ppx_deriving.std
 
-Executable "tomato-chan"
+Executable "tomato_chan"
   Path:             src/
   Install:          true
   CompiledObject:   best
   MainIs:           tomato_chan.ml
-  BuildDepends:     containers, re.posix, lwt.unix, jsonm, irc-client
+  BuildDepends:     tomato_chan_msg, lwt.unix, yojson, ppx_deriving_yojson,
+                    ppx_deriving.std, irc-client.lwt, inotify.lwt
 
+Executable "tomato_echo"
+  Path:             plugins/
+  Install:          true
+  CompiledObject:   best
+  MainIs:           tomato_echo.ml
+  BuildDepends:     tomato_chan_msg, yojson, ppx_deriving.std

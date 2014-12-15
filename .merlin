@@ -1,0 +1,11 @@
+S src
+B _build/src
+S plugins
+B _build/plugins
+PKG lwt.unix
+PKG lwt
+PKG irc-client
+PKG ppx_deriving_yojson
+PKG ppx_deriving.std
+PKG inotify.lwt
+PKG yojson

@@ -17,9 +17,11 @@ depends: [
     "ocamlfind" {build}
     "lwt"
     "unix"
-    "containers"
     "irc-client"
-    "re"
+    "yojson"
+    "ppx_deriving_yojson"
+    "ppx_deriving"
+    "inotify"
 ]
 tags: [ "irc" ]
 homepage: "https://github.com/c-cube/tomato-chan/"

@@ -7,3 +7,7 @@
 *.cmx
 *.cmxs
 *.cmxa
+*.native
+*.byte
+*.data
+*.exe
